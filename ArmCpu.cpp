@@ -30,9 +30,29 @@ volatile uint64_t armcpu_ipi_selftest_sent = 0;
 // 3 GICD_TYPER, 4 IGRPMODR0, 5 ICC_PMR_EL1, 6 ICC_IGRPEN1_EL1, 7 ICC_SRE_EL1.
 volatile uint32_t armcpu_gic_boot[8];
 volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   // per logical core: architectural timer interrupts and SGI 0 taken
+// The liveness watchdog. A core that stops taking its own timer also stops taking every other interrupt, and XNU
+// keeps scheduling on it because nothing in the bring-up ever failed: on 2026-11-06 rounds w11107151 and w21143362
+// one core counted its last timer interrupt at about ten seconds and then nothing for three minutes, while run=7,
+// step=7 and fail=0 said it was healthy. armcpu_core_deaf_mask is the set the observer has declared dead;
+// armcpu_core_deaf_events counts declarations so the console can show the watchdog ran rather than infer it.
+// armcpu-deaf-skip=1 makes signalCPU skip a declared core instead of poking it (the poke is wasted at best);
+// the default sends anyway, because a wrong declaration would then cost a lost cross-call, and a lost cross-call
+// is a correctness bug, not a diagnostic.
+volatile uint32_t armcpu_core_deaf_mask = 0, armcpu_core_deaf_events = 0;
+volatile uint64_t armcpu_ipi_skipped_deaf = 0;
+static bool gDeafSkip = false;              // boot-arg armcpu-deaf-skip=1
 static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs are software-pended SPIs 1008+core routed to that core (ICC_SGI1R_EL1 generates nothing on this board)
 static bool gSelfIpi = false;               // boot-arg armcpu-self-ipi=1: every core sends itself SGI 0 from initCPU
 volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
+// Per-core copy of the same phase, plus the physical count at which that core entered its handler. The
+// single global says only what the last core to run the handler was doing, so it cannot answer what a
+// core that stopped taking interrupts is stuck in. With these two, a deaf core whose phase is 2 was inside
+// rtclock_intr, one at 4 or 5 was inside the IPI handler (an xcall), one at 7 was inside a device handler,
+// and 0 or 6 means it was not in a handler at all and is masked somewhere else.
+volatile uint32_t armcpu_core_phase[8];
+// When that core entered its current handler, in cntpct units of 1024 (19.2 MHz / 1024 is 18750 Hz, so a
+// 32-bit word covers 63 hours and one count is 53 us). One word, so the reader never sees a torn value.
+volatile uint32_t armcpu_core_irq_enter[8];
 // IRQ drains (ArmCpu::interrupt takes interrupts until none is pending) that took more than 128, and the most one took. A burst
 // of timer pops is normal under a hypervisor: a vCPU held off its core finds the next deadline rtclock_intr set already past
 // when it signals end of interrupt, and the virtual timer fires again.
@@ -92,10 +112,26 @@ public:
 
 OSDefineMetaClassAndStructors (ArmCpu, IOCPU)
 
-// Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and PPI 27.
-static const uint32_t kSgiPpiEnable = 0xffffU | (1U << 27);
+// The EL1 virtual timer's PPI: INTID 27 by default (the SBSA assignment). boot-arg armcpu-timer-intid=<16..31> for SoCs that wire it
+// elsewhere: the TB128FU's SM6225 DT timer node lists PPIs 1, 2, 3, 0, so its virtual timer is INTID 19, and INTID 27 there is another
+// source that stays asserted (about 300000 interrupts a second per core, each taken as a timer tick).
+static uint32_t gTimerIntid = 27;
+// Redistributor ISENABLER0: SGIs 0..15 (only SGI 0 is used by the kernel; the others let the self-SGI probe tell which INTIDs the GIC accepts) and the timer PPI.
+static uint32_t sgiPpiEnable (void) { return 0xffffU | (1U << gTimerIntid); }
 
-static const uint32_t kIpiSpiBase = 1008;   // INTIDs 1008..1015 stand for 'IPI to logical core 0..7'
+// INTIDs base..base+7 stand for 'IPI to logical core 0..7': boot-arg armcpu-spi-ipi-base=<INTID>, or without it the distributor's
+// top eight (GICD_TYPER.ITLinesNumber, below the special INTIDs 1020..1023): 1012 on a GIC with 1020 INTIDs such as sheng's
+// (its old fixed 1008 is the same block shifted by four), 536 on the TB128FU's GIC of 544 (its DT leaves SPIs 430..511 unused),
+// and on pipa's SM8250 whatever its distributor reports (its DT uses SPIs up to 863).
+static uint32_t gIpiSpiBase = 1008;
+static bool gIpiSpiBaseGiven = false;
+extern "C" volatile uint32_t armcpu_spi_ipi_base;   // the base in use, for the board's log
+volatile uint32_t armcpu_spi_ipi_base = 0;
+extern "C" {
+// Per logical core, read back after spiIpiConfigure: bit 0 IGROUPR (Group 1), bit 1 ISENABLER, bits 8..15 IPRIORITYR,
+// bits 16..31 the low half of IROUTER; 0xffffffff not configured.
+volatile uint32_t armcpu_spi_ipi_check[8] = {~0U, ~0U, ~0U, ~0U, ~0U, ~0U, ~0U, ~0U};
+}
 
 static uint32_t read32 (uintptr_t base, unsigned offset)
 {
@@ -110,7 +146,7 @@ static void write32 (uintptr_t base, unsigned offset, uint32_t value)
 // Distributor side of the software IPI of logical core `core`: group 1, edge-triggered, priority 0x80, routed to affinity `aff`, enabled.
 static void spiIpiConfigure (uintptr_t dist, uint32_t core, uint64_t aff)
 {
-  const uint32_t id = kIpiSpiBase + core;
+  const uint32_t id = gIpiSpiBase + core;
   write32 (dist, 0x80 + (id / 32) * 4, read32 (dist, 0x80 + (id / 32) * 4) | (1U << (id % 32)));
   write32 (dist, 0xc00 + (id / 16) * 4, read32 (dist, 0xc00 + (id / 16) * 4) | (2U << ((id % 16) * 2)));
   write32 (dist, 0x400 + (id / 4) * 4, 0x80808080);
@@ -118,11 +154,16 @@ static void spiIpiConfigure (uintptr_t dist, uint32_t core, uint64_t aff)
   __asm__ volatile ("dsb sy" ::: "memory");
   write32 (dist, 0x100 + (id / 32) * 4, 1U << (id % 32));
   __asm__ volatile ("dsb sy" ::: "memory");
+  const uint32_t group = (read32 (dist, 0x80 + (id / 32) * 4) >> (id % 32)) & 1;
+  const uint32_t enabled = (read32 (dist, 0x100 + (id / 32) * 4) >> (id % 32)) & 1;
+  const uint32_t priority = (read32 (dist, 0x400 + (id / 4) * 4) >> ((id % 4) * 8)) & 0xff;
+  const uint32_t route = static_cast<uint32_t> (*reinterpret_cast<volatile uint64_t *>(dist + 0x6000 + 8ULL * id)) & 0xffff;
+  armcpu_spi_ipi_check[core & 7] = group | (enabled << 1) | (priority << 8) | (route << 16);
 }
 
 static void spiIpiSend (uintptr_t dist, uint32_t core)
 {
-  const uint32_t id = kIpiSpiBase + core;
+  const uint32_t id = gIpiSpiBase + core;
   __asm__ volatile ("dsb ishst" ::: "memory");
   write32 (dist, 0x200 + (id / 32) * 4, 1U << (id % 32));
   __asm__ volatile ("dsb sy" ::: "memory");
@@ -192,6 +233,24 @@ static class ArmCpu *volatile gPending[ARMCPU_SMP_SLOTS];
 static volatile uint32_t gBootRegistered = 0;
 static bool gRemoteGic = false; // sheng-smp-gic=1: the boot CPU prepares a new core's redistributor before CPU_ON
 
+// This fork's clusterType() looked a core up by logical number and indexed topology->cpus[]; upstream searches the array for
+// the matching phys_id instead. Both agree for the boot cluster and the second is the one upstream ships, so the merge kept
+// upstream's (above) and dropped this one.
+
+// Once every core of the topology is registered, ml_cpu_init_completed: the Edge scheduler then sets the edges between clusters
+// (without it no thread migrates or is stolen across clusters). AppleARMSMP calls it after starting all cores; here they come up
+// through ArmCpu. With sheng-smp=0 only the boot core registers and nothing is called, as before.
+static volatile uint32_t gRegisteredCores = 0;
+volatile uint32_t armcpu_init_completed = 0;
+static void noteRegistered (void)
+{
+  const ml_topology_info_t *topology = ml_get_topology_info ();
+  if (__atomic_add_fetch (&gRegisteredCores, 1U, __ATOMIC_ACQ_REL) == topology->num_cpus) {
+    ml_cpu_init_completed ();
+    armcpu_init_completed = 1;
+  }
+}
+
 // Shared peripheral interrupts (GICv3 SPIs, INTID 32..1019). A driver attaches a handler for one INTID; the line is set to
 // Group 1 non-secure, priority 0xa0, the given trigger and routed to the boot CPU (GICD_IROUTER, affinity routing is on),
 // then enabled. The handler runs in the primary interrupt context, before the EOI, and must clear a level source.
@@ -204,6 +263,17 @@ static uint64_t gBootAffinity = 0;
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
+// Interrupt accounting for boards whose IRQ rate is unexplained: IRQ exceptions in which the very first acknowledge already
+// returned a special INTID (>= 1020, nothing taken), per logical core, with ICC_HPPIR1_EL1 / ICC_RPR_EL1 / the raw IAR value of the
+// latest one; and the SPIs that reached an attached handler, with the latest INTID.
+volatile uint64_t armcpu_spurious = 0, armcpu_spi_handled = 0;
+volatile uint32_t armcpu_spurious_core[8], armcpu_spurious_hppir = 0, armcpu_spurious_rpr = 0, armcpu_spurious_iar = 0;
+volatile uint32_t armcpu_spi_handled_id = 0;
+// Per logical core, after rtclock_intr returned: how far ahead the virtual timer now is (CNTV_CVAL - CNTVCT, ticks) the last time,
+// and how often that was under 1000 ticks (about 52 us at 19.2 MHz): a deadline already in the past makes XNU program its
+// 10-tick minimum.
+volatile int32_t armcpu_timer_ahead[8];
+volatile uint32_t armcpu_timer_short[8];
 }
 
 IOService *ArmCpu::probe (IOService *provider, SInt32 *score)
@@ -290,6 +360,11 @@ bool ArmCpu::mapGic (void)
   gDist = dist;
   gFrames = redistBase;
   gFramesSize = redistSize;
+  if (!gIpiSpiBaseGiven) {
+    const uint32_t lines = ((read32 (dist, 0x4) & 0x1f) + 1) * 32;
+    gIpiSpiBase = (lines < 1020 ? lines : 1020) - 8;
+  }
+  armcpu_spi_ipi_base = gIpiSpiBase;
   return true;
 }
 
@@ -338,7 +413,7 @@ bool ArmCpu::wakeRedistributor (bool local)
   for (unsigned offset = 0x400; offset < 0x420; offset += 4) {
     write32 (sgi, offset, 0x80808080);
   }
-  if (!local) { write32 (sgi, 0x100, kSgiPpiEnable); }
+  if (!local) { write32 (sgi, 0x100, sgiPpiEnable ()); }
   __asm__ volatile ("dsb sy" ::: "memory");
   return waitClear (redist, 0, 8);
 }
@@ -367,7 +442,7 @@ void ArmCpu::enableGic (void)
   __asm__ volatile ("msr icc_bpr1_el1, %0" :: "r" (value) : "memory");
   if (!secondary) { gBootAffinity = affinity & 0xff00ffffffULL; }
   if (!secondary || !gRemoteGic) {
-    write32 (redist + 0x10000, 0x100, kSgiPpiEnable);
+    write32 (redist + 0x10000, 0x100, sgiPpiEnable ());
     write32 (dist, 0, read32 (dist, 0) | 0x12U);
   }
   value = 1;
@@ -401,9 +476,20 @@ bool ArmCpu::start (IOService *provider)
   unsigned spiIpi = 0;
   PE_parse_boot_argn ("armcpu-spi-ipi", &spiIpi, sizeof (spiIpi));
   gSpiIpi = spiIpi == 1;
+  unsigned deafSkip = 0;
+  PE_parse_boot_argn ("armcpu-deaf-skip", &deafSkip, sizeof (deafSkip));
+  gDeafSkip = deafSkip == 1;
   unsigned diagnostic = 0;
   PE_parse_boot_argn("armcpu-diagnostics", &diagnostic, sizeof(diagnostic));
   diagnosePower=diagnostic==1;
+  unsigned timerIntid = 27;
+  PE_parse_boot_argn ("armcpu-timer-intid", &timerIntid, sizeof (timerIntid));
+  if (timerIntid >= 16 && timerIntid < 32) { gTimerIntid = timerIntid; }
+  unsigned ipiBase = 0;
+  if (PE_parse_boot_argn ("armcpu-spi-ipi-base", &ipiBase, sizeof (ipiBase)) && ipiBase >= 32 && ipiBase + 8 <= 1020) {
+    gIpiSpiBase = ipiBase;
+    gIpiSpiBaseGiven = true;
+  }
   uint32_t physical;
   OSData *reg = OSDynamicCast (OSData, provider->getProperty ("reg"));
   memcpy (&physical, reg->getBytesNoCopy (), sizeof (physical));
@@ -434,6 +520,9 @@ bool ArmCpu::start (IOService *provider)
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (physical));
   info.cluster_type = clusterType (physical);
+  // Registration moved below, after the interrupt handler is installed: newer kernels boot the processor from
+  // ml_processor_register itself, so the handler has to exist first. noteRegistered() stays here in the sequence
+  // that follows, because this fork counts registered cores and calls ml_cpu_init_completed from it.
   setCPUNumber (info.log_id);
   unsigned smp = 0;
   PE_parse_boot_argn ("sheng-smp", &smp, sizeof (smp));
@@ -459,6 +548,7 @@ bool ArmCpu::start (IOService *provider)
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
   armcpu_registered = 1;
+  noteRegistered ();
   if (!bootInitialized) { initCPU (true); }
   registerService ();
   __atomic_store_n (&gBootRegistered, 1U, __ATOMIC_RELEASE);
@@ -494,6 +584,7 @@ bool ArmCpu::finishSecondary (void)
   setCPUState (kIOCPUStateUninitalized);
   registerService ();
   startSecondary ();
+  noteRegistered ();
   return true;
 }
 
@@ -602,39 +693,71 @@ void ArmCpu::dispatch (void *target, void *, void *, int)
 
 void ArmCpu::interrupt (void)
 {
+  /* One write for both the global phase and this core's own copy, stamped when the handler is entered.
+   * A core that stops taking interrupts is still inside whichever phase it last wrote; the console reads
+   * that copy for the deaf core only. */
+#define PHASE(v) do { \
+    armcpu_irq_phase = (v); \
+    if (logicalId < 8) { \
+      armcpu_core_phase[logicalId] = (v); \
+      if ((v) == 1) { uint64_t n_; __asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r" (n_)); armcpu_core_irq_enter[logicalId] = (uint32_t) (n_ >> 10); } \
+    } \
+  } while (0)
   unsigned drained=0;
   for (;;) {
-    armcpu_irq_phase=1;
+    PHASE(1);
     uint64_t id;
     __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (id));
     armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
     if ((id & 0xffffff) >= 1020) {
-      armcpu_irq_phase=0;
+      if (drained == 0) {
+        uint64_t hppir, rpr;
+        __asm__ volatile ("mrs %0, icc_hppir1_el1" : "=r" (hppir));
+        __asm__ volatile ("mrs %0, icc_rpr_el1" : "=r" (rpr));
+        armcpu_spurious = armcpu_spurious + 1;
+        armcpu_spurious_core[logicalId & 7] = armcpu_spurious_core[logicalId & 7] + 1;
+        armcpu_spurious_hppir = static_cast<uint32_t> (hppir);
+        armcpu_spurious_rpr = static_cast<uint32_t> (rpr);
+        armcpu_spurious_iar = static_cast<uint32_t> (id);
+      }
+      // A drain longer than 128 is normal under a hypervisor (a vCPU held off its core finds the next deadline
+      // already past), so it is counted rather than fatal; only a line nobody clears is a fault.
       if (drained > 128) { armcpu_irq_long_drains = armcpu_irq_long_drains + 1; }
       if (drained > armcpu_irq_drain_most) { armcpu_irq_drain_most = drained; }
-      break;
+      PHASE(0);break;
     }
-    // Only an interrupt that never stops coming (a level line nobody clears) is a fault: a million in one drain.
     ++drained;
     if(diagnosePower && drained>1000000)panic("ArmCpu: IRQ drain exceeds 1000000 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
-    if ((id & 0xffffff) == 27) {
+    if ((id & 0xffffff) == gTimerIntid) {
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
-      armcpu_irq_phase=2;
+      PHASE(2);
       rtclock_intr (0);
-      armcpu_irq_phase=3;
+      PHASE(3);
+      {
+        uint64_t cval, vct;
+        __asm__ volatile ("mrs %0, cntv_cval_el0" : "=r" (cval));
+        __asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (vct));
+        const int64_t ahead = static_cast<int64_t> (cval - vct);
+        armcpu_timer_ahead[logicalId & 7] = static_cast<int32_t> (ahead > 0x7fffffff ? 0x7fffffff : ahead < -0x7fffffff ? -0x7fffffff : ahead);
+        if (ahead < 1000) { armcpu_timer_short[logicalId & 7] = armcpu_timer_short[logicalId & 7] + 1; }
+      }
     } else if ((id & 0xffffff) == 0) {
       armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
-      armcpu_irq_phase=4;
+      PHASE(4);
       if (ipi_handler != nullptr) { ipi_handler (); }
-      armcpu_irq_phase=5;
-    } else if (gSpiIpi && (id & 0xffffff) >= kIpiSpiBase && (id & 0xffffff) < kIpiSpiBase + 8) {
+      PHASE(5);
+    } else if (gSpiIpi && (id & 0xffffff) >= gIpiSpiBase && (id & 0xffffff) < gIpiSpiBase + 8) {
       armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
-      armcpu_irq_phase = 4;
+      // The pending bit goes before the handler runs (UniXNU/ArmCpu eb0f053): a signal sent while the handler runs
+      // sets the bit again and raises the next interrupt, and one sent before is already in the mask the handler is
+      // about to read. A software-pended SPI left pending storms the core instead of signalling it once.
+      write32 (gDist, 0x280 + (((id & 0xffffff) / 32) * 4), 1U << ((id & 0xffffff) % 32));
+      PHASE(4);
       if (ipi_handler != nullptr) { ipi_handler (); }
-      armcpu_irq_phase = 5;
+      PHASE(5);
     } else {
       const uint32_t intid = static_cast<uint32_t> (id & 0xffffff);
       ArmCpuSpi *spi = nullptr;
@@ -643,8 +766,10 @@ void ArmCpu::interrupt (void)
         if (gSpi[slot].id == intid) { spi = &gSpi[slot]; }
       }
       if (spi != nullptr) {
-        armcpu_irq_phase = 7;
+        PHASE(7);
         spi->count = spi->count + 1;
+        armcpu_spi_handled = armcpu_spi_handled + 1;
+        armcpu_spi_handled_id = intid;
         spi->handler (spi->context);
       } else if (intid >= 32 && gDist != 0) {
         armcpu_spi_unhandled = armcpu_spi_unhandled + 1;
@@ -654,9 +779,10 @@ void ArmCpu::interrupt (void)
         panic ("ArmCpu: unexpected architectural IRQ %llu", id);
       }
     }
-    armcpu_irq_phase=6;
+    PHASE(6);
     __asm__ volatile ("msr icc_eoir1_el1, %0; isb" :: "r" (id) : "memory");
   }
+#undef PHASE
 }
 
 void ArmCpu::signalCPU (IOCPU *target)
@@ -666,11 +792,55 @@ void ArmCpu::signalCPU (IOCPU *target)
     panic ("ArmCpu: unsupported CPU signal target");
   }
   uint64_t aff = peer->signalTarget ();
+  if (gDeafSkip && ((__atomic_load_n (&armcpu_core_deaf_mask, __ATOMIC_RELAXED) >> (peer->logicalId & 7)) & 1u)) {
+    armcpu_ipi_skipped_deaf = armcpu_ipi_skipped_deaf + 1;
+    return;
+  }
   uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) |
                  ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
   armcpu_ipi_sent = armcpu_ipi_sent + 1;
   if (gSpiIpi) { spiIpiSend (gDist, peer->logicalId & 7); return; }
   __asm__ volatile ("dsb ishst; msr icc_sgi1r_el1, %0; isb" :: "r" (sgi) : "memory");
+}
+
+// The boot log's core-health thread declares a core here once its timer count has not moved for three
+// consecutive samples (thirty seconds). Declaring is idempotent; the event count says how many cores
+// the watchdog has declared since boot, so a console row can show it ran rather than imply it.
+extern "C" void armcpu_core_note_deaf (uint32_t core)
+{
+  if (core >= 8) { return; }
+  const uint32_t bit = 1u << core;
+  const uint32_t was = __atomic_fetch_or (&armcpu_core_deaf_mask, bit, __ATOMIC_RELAXED);
+  if (!(was & bit)) { armcpu_core_deaf_events = armcpu_core_deaf_events + 1; }
+}
+
+// Reads another core's redistributor frame from this core, for a core the watchdog has declared deaf. Such a
+// core takes no timer interrupt and no SGI while XNU still counts it running, and three readings separate the
+// causes: interrupts pending but never taken (the core is masked or halted), enables cleared (its GIC was
+// turned off), or nothing pending at all (no sender targets it). Read-only; the frame is found by affinity.
+// out: 0 GICR_TYPER affinity word, 1 GICR_ISPENDR0, 2 GICR_ISENABLER0, 3 GICR_ISACTIVER0, 4 GICR_WAKER.
+extern "C" int armcpu_core_gicr_probe (uint32_t core, uint32_t out[5])
+{
+  if (core >= 8 || gFrames == 0 || out == nullptr) { return -1; }
+  uint32_t affinity = armcpu_smp_mpidr[core];
+  if (affinity == 0) { affinity = armcpu_smp_seen_mpidr[core]; }
+  const uint32_t target = (affinity & 0xffffff) | ((affinity >> 8) & 0xff000000);
+  uintptr_t frames = gFrames;
+  for (uint64_t offset = 0; offset + 0x20000 <= gFramesSize;) {
+    uint64_t typer = *reinterpret_cast<volatile uint64_t *> (frames + offset + 8);
+    if (static_cast<uint32_t> (typer >> 32) == target) {
+      uintptr_t sgi = frames + offset + 0x10000;
+      out[0] = static_cast<uint32_t> (typer >> 32);
+      out[1] = *reinterpret_cast<volatile uint32_t *> (sgi + 0x200);
+      out[2] = *reinterpret_cast<volatile uint32_t *> (sgi + 0x100);
+      out[3] = *reinterpret_cast<volatile uint32_t *> (sgi + 0x300);
+      out[4] = *reinterpret_cast<volatile uint32_t *> (frames + offset + 0x14);
+      return 0;
+    }
+    if ((typer & 16) != 0) { break; }
+    offset += gRedistStride != 0 ? gRedistStride : ((typer & 2) != 0 ? 0x40000 : 0x20000);
+  }
+  return -1;
 }
 
 // Diagnostic: sends SGI 0 to the core whose MPIDR affinity is aff (the DT "reg" value, e.g. 0x100 for core 1) exactly as signalCPU
